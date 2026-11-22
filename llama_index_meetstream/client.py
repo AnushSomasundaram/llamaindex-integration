@@ -23,7 +23,7 @@ import logging
 import os
 import time
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from pydantic import BaseModel
@@ -56,6 +56,9 @@ _DEFAULT_PROVIDER_OPTIONS: dict[str, dict[str, Any]] = {"meetstream": {"language
 
 # Transient server errors MeetStream documents as safe to retry with backoff.
 _RETRY_STATUSES = frozenset({500, 502, 503, 504})
+# For chat messages and images, only 503 ("command channel not connected yet") means the
+# command wasn't accepted; after a 500 it may already have gone through, so it isn't repeated.
+_COMMAND_RETRY_STATUSES = frozenset({503})
 _MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY_SECONDS = 1.0
 
@@ -112,6 +115,15 @@ class MeetingActionResult(BaseModel):
     action: str
     status: str
     detail: str | None = None
+
+
+def _bot_path(bot_id: str, endpoint: str) -> str:
+    """`/bots/<bot_id>/<endpoint>`, with the id URL-encoded.
+
+    Ids often come from an LLM tool call; encoding keeps an id like `abc/remove_bot#` from
+    turning a read into a different MeetStream call.
+    """
+    return f"/bots/{quote(str(bot_id), safe='')}/{endpoint}"
 
 
 def infer_platform(meeting_url: str | None) -> str | None:
@@ -205,10 +217,15 @@ class MeetStreamClient:
     # ------------------------------------------------------------------ transport
 
     def _request(
-        self, method: str, path: str, *, json: dict[str, Any] | None = None, retry: bool = True
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        retry_statuses: frozenset[int] = _RETRY_STATUSES,
     ) -> httpx.Response:
-        """Send one request, retrying transient 5xx responses when `retry` is set."""
-        attempts = _MAX_ATTEMPTS if retry else 1
+        """Send a request, making up to `_MAX_ATTEMPTS` attempts while the status is in `retry_statuses`."""
+        attempts = _MAX_ATTEMPTS if retry_statuses else 1
         for attempt in range(attempts):
             try:
                 response = self._http.request(method, path, json=json)
@@ -216,7 +233,7 @@ class MeetStreamClient:
                 raise MeetStreamConnectionError(f"MeetStream did not respond to {method} {path} in time") from exc
             except httpx.RequestError as exc:
                 raise MeetStreamConnectionError(f"Could not reach MeetStream at {self._http.base_url}: {exc}") from exc
-            if response.status_code in _RETRY_STATUSES and attempt < attempts - 1:
+            if response.status_code in retry_statuses and attempt < attempts - 1:
                 delay = _RETRY_BASE_DELAY_SECONDS * (2**attempt)
                 logger.warning("MeetStream %s %s returned %d; retrying in %.1fs", method, path, response.status_code, delay)
                 time.sleep(delay)
@@ -255,7 +272,13 @@ class MeetStreamClient:
 
     @staticmethod
     def _json(response: httpx.Response) -> Any:
-        return response.json() if response.content else None
+        """The decoded body, or `None` if it's empty or not JSON."""
+        if not response.content:
+            return None
+        try:
+            return response.json()
+        except ValueError:
+            return None
 
     # ------------------------------------------------------------------ bots
 
@@ -290,7 +313,7 @@ class MeetStreamClient:
         if transcript is not None:
             payload["recording_config"] = {"transcript": transcript}
 
-        response = self._request("POST", "/bots/create_bot", json=payload, retry=False)
+        response = self._request("POST", "/bots/create_bot", json=payload, retry_statuses=frozenset())
         if response.status_code in (400, 422):
             raise MeetStreamAPIError(
                 self._message(response, "MeetStream rejected the meeting link or bot settings"),
@@ -299,7 +322,11 @@ class MeetStreamClient:
             )
         self._raise_for_status(response, what="create_bot")
         raw = self._json(response) or {}
-        bot_id = raw["bot_id"]
+        bot_id = raw.get("bot_id") if isinstance(raw, dict) else None
+        if not bot_id:
+            raise MeetStreamAPIError(
+                "MeetStream accepted create_bot but returned no bot_id", code="upstream_error", status_code=response.status_code
+            )
         self._meeting_urls[bot_id] = raw.get("meeting_url") or meeting_url
         return BotDispatchResult(
             bot_id=bot_id, meeting_id=bot_id, status=raw.get("status") or "unknown", transcript_id=raw.get("transcript_id")
@@ -307,7 +334,7 @@ class MeetStreamClient:
 
     def get_meeting(self, meeting_id: str) -> MeetingMetadata:
         """The bot's current status (`GET /bots/{bot_id}/status`)."""
-        response = self._request("GET", f"/bots/{meeting_id}/status")
+        response = self._request("GET", _bot_path(meeting_id, "status"))
         self._raise_for_status(response, what=f"meeting {meeting_id}")
         raw = self._json(response) or {}
         meeting_url = self._meeting_urls.get(meeting_id)
@@ -330,7 +357,7 @@ class MeetStreamClient:
             admitted (409), or processing failed (422). Retrying won't help.
           - `"meeting_not_found"` (404): no such bot, or no transcript exists for it.
         """
-        response = self._request("GET", f"/bots/{meeting_id}/get_transcript")
+        response = self._request("GET", _bot_path(meeting_id, "get_transcript"))
         if response.status_code == 202:
             raise MeetStreamAPIError(
                 self._message(response, f"Transcript for {meeting_id} is still processing"),
@@ -348,8 +375,16 @@ class MeetStreamClient:
 
     # ------------------------------------------------------------------ in-meeting actions
 
-    def _action(self, meeting_id: str, action: str, method: str, path: str, json: dict[str, Any] | None = None):
-        response = self._request(method, path, json=json)
+    def _action(
+        self,
+        meeting_id: str,
+        action: str,
+        method: str,
+        path: str,
+        json: dict[str, Any] | None = None,
+        retry_statuses: frozenset[int] = _RETRY_STATUSES,
+    ) -> MeetingActionResult:
+        response = self._request(method, path, json=json, retry_statuses=retry_statuses)
         if response.status_code == 409:
             raise MeetStreamAPIError(
                 self._message(response, f"The bot for {meeting_id} is not currently in a meeting"),
@@ -364,7 +399,12 @@ class MeetStreamClient:
     def send_chat_message(self, meeting_id: str, message: str) -> MeetingActionResult:
         """Post `message` (1-2000 characters) into the meeting chat."""
         return self._action(
-            meeting_id, "send_chat_message", "POST", f"/bots/{meeting_id}/send_message", {"message": message}
+            meeting_id,
+            "send_chat_message",
+            "POST",
+            _bot_path(meeting_id, "send_message"),
+            {"message": message},
+            retry_statuses=_COMMAND_RETRY_STATUSES,
         )
 
     def send_image(self, meeting_id: str, image_url: str, display_duration_seconds: float | None = None) -> MeetingActionResult:
@@ -372,11 +412,13 @@ class MeetStreamClient:
         payload: dict[str, Any] = {"img_url": image_url}
         if display_duration_seconds is not None:
             payload["display_duration"] = display_duration_seconds
-        return self._action(meeting_id, "send_image", "POST", f"/bots/{meeting_id}/send_image", payload)
+        return self._action(
+            meeting_id, "send_image", "POST", _bot_path(meeting_id, "send_image"), payload, retry_statuses=_COMMAND_RETRY_STATUSES
+        )
 
     def leave_meeting(self, meeting_id: str) -> MeetingActionResult:
         """Make the bot leave (`GET /bots/{bot_id}/remove_bot`). Recorded data is kept."""
-        return self._action(meeting_id, "leave_meeting", "GET", f"/bots/{meeting_id}/remove_bot")
+        return self._action(meeting_id, "leave_meeting", "GET", _bot_path(meeting_id, "remove_bot"))
 
     def perform_meeting_action(
         self, meeting_id: str, action: Literal["send_chat_message", "send_image", "leave_meeting"], **payload: Any

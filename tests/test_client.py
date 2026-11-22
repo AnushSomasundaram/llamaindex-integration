@@ -145,6 +145,44 @@ def test_persistent_5xx_raises_upstream_error(api_mock, client):
     assert excinfo.value.code == "upstream_error"
 
 
+def test_chat_message_is_not_repeated_after_a_500(api_mock, client):
+    route = api_mock.post(f"/bots/{BOT}/send_message").mock(return_value=httpx.Response(500))
+    with pytest.raises(MeetStreamAPIError):
+        client.send_chat_message(BOT, "hello")
+    assert route.call_count == 1
+
+
+def test_chat_message_is_retried_while_the_command_channel_connects(api_mock, client):
+    route = api_mock.post(f"/bots/{BOT}/send_message").mock(
+        side_effect=[httpx.Response(503), httpx.Response(200, json={"status": "accepted"})]
+    )
+    assert client.send_chat_message(BOT, "hello").detail == "accepted"
+    assert route.call_count == 2
+
+
+def test_create_bot_without_bot_id_is_an_error(api_mock, client):
+    api_mock.post("/bots/create_bot").mock(return_value=httpx.Response(201, json={"status": "Active"}))
+    with pytest.raises(MeetStreamAPIError) as excinfo:
+        client.dispatch_bot("https://zoom.us/j/1")
+    assert excinfo.value.code == "upstream_error"
+
+
+def test_bot_ids_are_url_encoded(api_mock, client):
+    route = api_mock.get("/bots/abc%2Fremove_bot%23/status").mock(
+        return_value=httpx.Response(200, json={"bot_id": "x", "status": "Stopped"})
+    )
+    removed = api_mock.get("/bots/abc/remove_bot").mock(return_value=httpx.Response(200, json={}))
+    client.get_meeting("abc/remove_bot#")
+    assert route.called and not removed.called
+
+
+def test_non_json_transcript_body_is_a_format_error(api_mock, client):
+    api_mock.get(f"/bots/{BOT}/get_transcript").mock(return_value=httpx.Response(200, text="<html>oops</html>"))
+    with pytest.raises(MeetStreamAPIError) as excinfo:
+        client.get_transcript(BOT)
+    assert excinfo.value.code == "transcript_format_error"
+
+
 def test_network_failure_raises_connection_error():
     client = MeetStreamClient(api_key="k", base_url="http://this-host-does-not-exist.invalid", timeout=1.0)
     with pytest.raises(MeetStreamConnectionError):

@@ -63,9 +63,10 @@ pre-chunk; LlamaIndex's node parsers split further if needed.
 ## Errors and retries
 
 HTTP statuses map to `MeetStreamAPIError.code` values (see `exceptions.py`). MeetStream's
-`message` field is used as the exception text when it has one. Reads and in-meeting actions
-retry transient 500/502/503/504 responses up to three times with exponential backoff.
-`create_bot` is never retried. Network failures and timeouts raise `MeetStreamConnectionError`.
+`message` field is used as the exception text when it has one. Reads and `remove_bot` make up
+to three attempts on 500/502/503/504, with exponential backoff. Chat messages and images are
+retried only on 503 (MeetStream's "command channel not connected yet"), because after a 500
+the message may already have been posted. `create_bot` is never retried. Network failures and timeouts raise `MeetStreamConnectionError`.
 
 ## Sync, not async
 
